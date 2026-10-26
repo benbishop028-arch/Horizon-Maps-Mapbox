@@ -1,1 +1,70 @@
-
+name: Build Horizon Nav Mapbox
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Also publish the app to the download link (so the app's update check finds it)"
+        type: boolean
+        default: false
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Unpack the uploaded zip
+        run: |
+          ZIP=$(ls *.zip | head -1)
+          if [ -z "$ZIP" ]; then echo "No zip uploaded yet"; exit 1; fi
+          echo "Using $ZIP"
+          unzip -q -o "$ZIP" -d src
+          DIR=$(dirname "$(find src -name settings.gradle.kts | head -1)")
+          echo "PROJECT=$DIR" >> "$GITHUB_ENV"
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: 17 }
+      - name: Accept the Android licences
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - name: Use the same signing key every time (so updates install over the old version)
+        run: |
+          if [ ! -f signing.keystore ]; then
+            keytool -genkeypair -keystore signing.keystore -storepass android -keypass android -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+            git config user.name "github-actions"
+            git config user.email "github-actions@users.noreply.github.com"
+            git add signing.keystore
+            git commit -m "Add signing key"
+            git push
+          fi
+          mkdir -p ~/.android
+          cp signing.keystore ~/.android/debug.keystore
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: 8.14.4 }
+      - name: Build release APK
+        working-directory: ${{ env.PROJECT }}
+        # the Mapbox download token comes from the repo's secret (only used if Mapbox asks for it)
+        env:
+          MAPBOX_DOWNLOADS_TOKEN: ${{ secrets.MAPBOX_DOWNLOADS_TOKEN }}
+        run: gradle :app:assembleRelease -PtomtomApiKey="${{ secrets.TOMTOM_API_KEY }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HorizonNav-mapbox-apk
+          path: ${{ env.PROJECT }}/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+      # Only when you tick "publish" on Run workflow: the APK goes to the release called "app", replacing the one there,
+      # so this link always gives the newest version:
+      #   https://github.com/<you>/<repo>/releases/download/app/HorizonNav-mapbox.apk
+      - name: Publish the app
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK="${{ env.PROJECT }}/app/build/outputs/apk/release/HorizonNav-mapbox.apk"
+          [ -f "$APK" ] || { echo "No APK was built"; exit 1; }
+          NOTES="Horizon Nav Mapbox 1.0.${{ github.run_number }}, built $(date -u '+%-d %b %Y'). Download HorizonNav-mapbox.apk below and install it over the old one."
+          gh release create app --repo "${{ github.repository }}" --title "Horizon Nav Mapbox" --notes "$NOTES" --latest=false 2>/dev/null \
+            || gh release edit app --repo "${{ github.repository }}" --title "Horizon Nav Mapbox (1.0.${{ github.run_number }})" --notes "$NOTES"
+          gh release upload app "$APK" --repo "${{ github.repository }}" --clobber
+          echo "Download link: https://github.com/${{ github.repository }}/releases/download/app/HorizonNav-mapbox.apk"
